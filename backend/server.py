@@ -7,6 +7,7 @@ import certifi
 import asyncio
 import hashlib
 import hmac
+import threading
 import uuid
 import httpx
 import time
@@ -225,12 +226,13 @@ def signed_image_url(image_id: str, session_id: str) -> str:
     return f"/api/chat/images/{image_id}?session_id={session_id}&token={token}"
 
 def create_mongo_client():
-    """兼容 Vercel Serverless 的 MongoDB 连接"""
+    """兼容 Vercel Serverless 的 MongoDB 连接。每份程序只留很少的连接，空闲后放开。"""
     common = {
         "serverSelectionTimeoutMS": 20000,
         "connectTimeoutMS": 20000,
         "socketTimeoutMS": 20000,
-        "maxPoolSize": 10,
+        "maxPoolSize": 2,
+        "maxIdleTimeMS": 60000,
         "retryWrites": True,
     }
     if MONGO_URL.startswith("mongodb+srv://"):
@@ -251,6 +253,7 @@ chat_images_fs = AsyncIOMotorGridFSBucket(db, bucket_name="chat_images")
 
 _last_db_error = ""
 _mongo_loop_id = None
+_mongo_client_lock = threading.Lock()
 
 async def ping_database():
     global _last_db_error
@@ -265,10 +268,20 @@ async def ping_database():
 
 _indexes_ready = False
 
+def _close_mongo_client(client):
+    if client is None:
+        return
+    try:
+        client.close()
+    except Exception as e:
+        logger.warning("mongo client close failed: %s", e)
+
+
 def ensure_mongo_context():
     """
     Vercel Serverless 可能在不同事件循环中复用模块级对象。
     Motor 客户端绑定旧 loop 后会出现 RuntimeError（如 Task cb...）。
+    换新连接时关掉旧的，避免免费版连接数被占满。
     """
     global mongo_client, db, config_collection, whitelist_collection, blacklist_collection
     global chat_sessions_collection, chat_messages_collection, chat_images_fs
@@ -282,16 +295,24 @@ def ensure_mongo_context():
     if _mongo_loop_id == loop_id:
         return
 
-    mongo_client = create_mongo_client()
-    db = mongo_client.exchange_db
-    config_collection = db.config
-    whitelist_collection = db.whitelist
-    blacklist_collection = db.blacklist
-    chat_sessions_collection = db.chat_sessions
-    chat_messages_collection = db.chat_messages
-    chat_images_fs = AsyncIOMotorGridFSBucket(db, bucket_name="chat_images")
-    _mongo_loop_id = loop_id
-    _indexes_ready = False
+    old = None
+    with _mongo_client_lock:
+        if _mongo_loop_id == loop_id:
+            return
+        new_client = create_mongo_client()
+        old = mongo_client
+        mongo_client = new_client
+        db = mongo_client.exchange_db
+        config_collection = db.config
+        whitelist_collection = db.whitelist
+        blacklist_collection = db.blacklist
+        chat_sessions_collection = db.chat_sessions
+        chat_messages_collection = db.chat_messages
+        chat_images_fs = AsyncIOMotorGridFSBucket(db, bucket_name="chat_images")
+        _mongo_loop_id = loop_id
+        _indexes_ready = False
+    if old is not None and old is not mongo_client:
+        _close_mongo_client(old)
 
 async def ensure_indexes():
     global _indexes_ready
